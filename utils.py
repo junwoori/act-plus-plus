@@ -48,46 +48,74 @@ class EpisodicDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         episode_id, start_ts = self._locate_transition(index)
         dataset_path = self.dataset_path_list[episode_id]
+        
         try:
-            # print(dataset_path)
+            print(f"[INFO] Opening: {dataset_path}")
+            print(f"[INFO] start_ts: {start_ts}")
+
             with h5py.File(dataset_path, 'r') as root:
-                try: # some legacy data does not have this attribute
-                    is_sim = root.attrs['sim']
-                except:
-                    is_sim = False
+                is_sim = root.attrs.get('sim', False)
                 compressed = root.attrs.get('compress', False)
-                if '/base_action' in root:
-                    base_action = root['/base_action'][()]
-                    base_action = preprocess_base_action(base_action)
-                    action = np.concatenate([root['/action'][()], base_action], axis=-1)
-                else:  
-                    action = root['/action'][()]
-                    dummy_base_action = np.zeros([action.shape[0], 2])
-                    action = np.concatenate([action, dummy_base_action], axis=-1)
+
+                # Load action
+                try:
+                    if '/base_action' in root:
+                        base_action = root['/base_action'][()]
+                        base_action = preprocess_base_action(base_action)
+                        action = np.concatenate([root['/action'][()], base_action], axis=-1)
+                    else:
+                        action = root['/action'][()]
+                        dummy_base_action = np.zeros([action.shape[0], 2])
+                        action = np.concatenate([action, dummy_base_action], axis=-1)
+                except Exception as e:
+                    print(f"[ERROR] Failed to load action: {e}")
+                    raise
+
                 original_action_shape = action.shape
                 episode_len = original_action_shape[0]
-                # get observation at start_ts only
-                qpos = root['/observations/qpos'][start_ts]
-                qvel = root['/observations/qvel'][start_ts]
+
+                # Load observations
+                try:
+                    qpos = root['/observations/qpos'][start_ts]
+                    qvel = root['/observations/qvel'][start_ts]
+                    print(f"[INFO] qpos shape: {root['/observations/qpos'].shape}")
+                    print(f"[INFO] qvel shape: {root['/observations/qvel'].shape}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to load qpos/qvel: {e}")
+                    raise
+
+                # Load images
                 image_dict = dict()
-                for cam_name in self.camera_names:
-                    image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
-                
+                print(f"[INFO] camera_names: {self.camera_names}")
+                try:
+                    for cam_name in self.camera_names:
+                        path = f'/observations/images/{cam_name}'
+                        if path not in root:
+                            raise KeyError(f"Missing image key: {path}")
+                        image_dict[cam_name] = root[path][start_ts]
+                except Exception as e:
+                    print(f"[ERROR] Failed to load image data: {e}")
+                    raise
+
                 if compressed:
                     for cam_name in image_dict.keys():
-                        decompressed_image = cv2.imdecode(image_dict[cam_name], 1)
-                        image_dict[cam_name] = np.array(decompressed_image)
-                
-                # get all actions after and including start_ts
+                        try:
+                            decompressed_image = cv2.imdecode(image_dict[cam_name], cv2.IMREAD_COLOR)
+                            image_dict[cam_name] = np.array(decompressed_image)
+                        except Exception as e:
+                            print(f"[ERROR] Failed to decompress {cam_name}: {e}")
+                            raise
+
+                # Select relevant action frames
                 if is_sim:
                     action = action[start_ts:]
                     action_len = episode_len - start_ts
                 else:
-                    action = action[max(0, start_ts - 1):] # hack, to make timesteps more aligned
-                    action_len = episode_len - max(0, start_ts - 1) # hack, to make timesteps more aligned
+                    action = action[max(0, start_ts - 1):]
+                    action_len = episode_len - max(0, start_ts - 1)
 
-            # self.is_sim = is_sim
-            padded_action = np.zeros((self.max_episode_len, original_action_shape[1]), dtype=np.float32)
+            # Padding
+            padded_action = np.zeros((self.max_episode_len, original_action_shape[-1]))
             padded_action[:action_len] = action
             is_pad = np.zeros(self.max_episode_len)
             is_pad[action_len:] = 1
@@ -95,55 +123,50 @@ class EpisodicDataset(torch.utils.data.Dataset):
             padded_action = padded_action[:self.chunk_size]
             is_pad = is_pad[:self.chunk_size]
 
-            # new axis for different cameras
-            all_cam_images = []
-            for cam_name in self.camera_names:
-                all_cam_images.append(image_dict[cam_name])
+            # Convert images to tensor [K, C, H, W]
+            all_cam_images = [image_dict[cam_name] for cam_name in self.camera_names]
             all_cam_images = np.stack(all_cam_images, axis=0)
+            image_data = torch.from_numpy(all_cam_images).float()
+            image_data = torch.einsum('k h w c -> k c h w', image_data)
 
-            # construct observations
-            image_data = torch.from_numpy(all_cam_images)
+            # Convert other data to tensors
             qpos_data = torch.from_numpy(qpos).float()
             action_data = torch.from_numpy(padded_action).float()
             is_pad = torch.from_numpy(is_pad).bool()
 
-            # channel last
-            image_data = torch.einsum('k h w c -> k c h w', image_data)
-
-            # augmentation
+            # Apply transforms if specified
             if self.transformations is None:
-                print('Initializing transformations')
+                print('[INFO] Initializing transformations')
                 original_size = image_data.shape[2:]
                 ratio = 0.95
                 self.transformations = [
                     transforms.RandomCrop(size=[int(original_size[0] * ratio), int(original_size[1] * ratio)]),
                     transforms.Resize(original_size, antialias=True),
                     transforms.RandomRotation(degrees=[-5.0, 5.0], expand=False),
-                    transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5) #, hue=0.08)
+                    transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.2, hue=0.05),
                 ]
 
             if self.augment_images:
                 for transform in self.transformations:
                     image_data = transform(image_data)
 
-            # normalize image and change dtype to float
+            # Normalize image
             image_data = image_data / 255.0
 
+            # Normalize action
             if self.policy_class == 'Diffusion':
-                # normalize to [-1, 1]
                 action_data = ((action_data - self.norm_stats["action_min"]) / (self.norm_stats["action_max"] - self.norm_stats["action_min"])) * 2 - 1
             else:
-                # normalize to mean 0 std 1
                 action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
 
+            # Normalize qpos
             qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
-        except:
-            print(f'Error loading {dataset_path} in __getitem__')
-            quit()
+            return image_data, qpos_data, action_data, is_pad
 
-        # print(image_data.dtype, qpos_data.dtype, action_data.dtype, is_pad.dtype)
-        return image_data, qpos_data, action_data, is_pad
+        except Exception as e:
+            print(f"[FATAL ERROR] Failed to load {dataset_path} in __getitem__: {e}")
+            raise
 
 
 def get_norm_stats(dataset_path_list):
@@ -189,9 +212,9 @@ def get_norm_stats(dataset_path_list):
 
     eps = 0.0001
     stats = {"action_mean": action_mean.numpy(), "action_std": action_std.numpy(),
-             "action_min": action_min.numpy() - eps,"action_max": action_max.numpy() + eps,
-             "qpos_mean": qpos_mean.numpy(), "qpos_std": qpos_std.numpy(),
-             "example_qpos": qpos}
+            "action_min": action_min.numpy() - eps,"action_max": action_max.numpy() + eps,
+            "qpos_mean": qpos_mean.numpy(), "qpos_std": qpos_std.numpy(),
+            "example_qpos": qpos}
 
     return stats, all_episode_len
 

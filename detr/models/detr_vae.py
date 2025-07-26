@@ -267,10 +267,8 @@ def build_encoder(args):
 
 
 def build(args):
-    state_dim = 14 # TODO hardcode
+    state_dim = 14  # TODO hardcode
 
-    # From state
-    # backbone = None # from state for now, no need for conv nets
     # From image
     backbones = []
     for _ in args.camera_names:
@@ -282,7 +280,7 @@ def build(args):
     if args.no_encoder:
         encoder = None
     else:
-        encoder = build_transformer(args)
+        encoder = build_encoder(args)  # ✅ fix: use encoder, not transformer
 
     model = DETRVAE(
         backbones,
@@ -298,9 +296,10 @@ def build(args):
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("number of parameters: %.2fM" % (n_parameters/1e6,))
+    print("number of parameters: %.2fM" % (n_parameters / 1e6,))
 
     return model
+
 
 def build_cnnmlp(args):
     state_dim = 14 # TODO hardcode

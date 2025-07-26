@@ -34,6 +34,13 @@ def main(args):
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
+    chunk_size = args["chunk_size"]
+
+    print("[DEBUG] args.keys():", args.keys())
+    required = ["ckpt_dir", "policy_class", "task_name", "seed", "num_steps"]
+    for r in required:
+        print(f"[DEBUG] args['{r}']:", args.get(r, None))
+
 
     # get task parameters
     is_sim = task_name[:4] == 'sim_'
@@ -46,7 +53,7 @@ def main(args):
     dataset_dir = task_config['dataset_dir']
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
-    camera_names = task_config['camera_names']
+    camera_names = ['left_wrist', 'right_wrist', 'top']
     name_filter = task_config.get('name_filter', lambda n: True)
 
     # fixed parameters
@@ -93,7 +100,7 @@ def main(args):
         'camera_names': camera_names,
         'real_robot': not is_sim
     }
-
+    config['num_steps'] = args.get('num_steps', 10000)
     # if is_eval:
     #     ckpt_names = [f'policy_best.ckpt']
     #     results = []
@@ -106,7 +113,7 @@ def main(args):
     #     print()
     #     exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, name_filter, camera_names, batch_size_train, batch_size_val)
+    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, name_filter, camera_names,batch_size_train, batch_size_val, chunk_size)
 
     # save dataset stats
     # if not os.path.isdir(ckpt_dir):
@@ -123,6 +130,8 @@ def main(args):
     ckpt_path = os.path.join(ckpt_dir, f'latent_model_best.ckpt')
     torch.save(best_state_dict, ckpt_path)
     print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
+
+    
 
 
 def make_policy(policy_class, policy_config):
@@ -151,7 +160,7 @@ def get_image(ts, camera_names):
         curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
-    curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
+    curr_image = torch.from_numpy(curr_image / 255.0).float().to(device).unsqueeze(0)
     return curr_image
 
 
@@ -174,7 +183,7 @@ def get_image(ts, camera_names):
 #     policy = make_policy(policy_class, policy_config)
 #     loading_status = policy.load_state_dict(torch.load(ckpt_path))
 #     print(loading_status)
-#     policy.cuda()
+#     policy.to(device)
 #     policy.eval()
 #     print(f'Loaded: {ckpt_path}')
 #     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
@@ -223,9 +232,9 @@ def get_image(ts, camera_names):
 
 #         ### evaluation loop
 #         if temporal_agg:
-#             all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
+#             all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).to(device)
 
-#         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
+#         qpos_history = torch.zeros((1, max_timesteps, state_dim)).to(device)
 #         image_list = [] # for visualization
 #         qpos_list = []
 #         target_qpos_list = []
@@ -246,7 +255,7 @@ def get_image(ts, camera_names):
 #                     image_list.append({'main': obs['image']})
 #                 qpos_numpy = np.array(obs['qpos'])
 #                 qpos = pre_process(qpos_numpy)
-#                 qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+#                 qpos = torch.from_numpy(qpos).float().to(device).unsqueeze(0)
 #                 qpos_history[:, t] = qpos
 #                 curr_image = get_image(ts, camera_names)
 
@@ -262,7 +271,7 @@ def get_image(ts, camera_names):
 #                         k = 0.01
 #                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
 #                         exp_weights = exp_weights / exp_weights.sum()
-#                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+#                         exp_weights = torch.from_numpy(exp_weights).to(device).unsqueeze(dim=1)
 #                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
 #                     else:
 #                         raw_action = all_actions[:, t % query_frequency]
@@ -320,9 +329,15 @@ def get_image(ts, camera_names):
 #     return success_rate, avg_return
 
 
-def forward_pass(data, policy, latent_model):
+def forward_pass(data, policy, latent_model, device):
     image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+
+    #CUDA 전송
+    image_data = image_data.to(device)
+    qpos_data = qpos_data.to(device)
+    action_data = action_data.to(device)
+    is_pad = is_pad.to(device)
+
     forward_dict = {}
     gt_labels = policy.vq_encode(qpos_data, action_data, is_pad)
     inputs = torch.cat([torch.zeros_like(gt_labels)[:, [0]], gt_labels[:, :-1]], dim=1)
@@ -344,88 +359,104 @@ def forward_pass(data, policy, latent_model):
 
 
 def train_bc(train_dataloader, val_dataloader, config, ckpt_name):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_epochs = config['num_epochs']
     ckpt_dir = config['ckpt_dir']
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
 
+    save_every = config.get('save_every', 10)
+    eval_every = config.get('eval_every', 1)
+    validate_every = config.get('validate_every', 1)
+
     set_seed(seed)
 
-    vq_dim = config['policy_config']['vq_dim']
-    vq_class = config['policy_config']['vq_class']
-    latent_model = Latent_Model_Transformer(vq_dim, vq_dim, vq_class)
-    latent_model.cuda()
+    if policy_class == 'CNNMLP':
+        raise NotImplementedError("Latent model training is not supported for policy_class == 'CNNMLP'.")
+
+    
+
+    vq_dim = policy_config['vq_dim']
+    vq_class = policy_config['vq_class']
+    latent_model = Latent_Model_Transformer(vq_dim, vq_dim, vq_class).to(device)
 
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+    policy_config['action_dim'] = 16
     policy = make_policy(policy_class, policy_config)
-    loading_status = policy.load_state_dict(torch.load(ckpt_path))
+
+    if os.path.exists(ckpt_path):
+        _ = policy.load_state_dict(torch.load(ckpt_path, map_location=device))
+        print(f"[INFO] Loaded checkpoint from: {ckpt_path}")
+    else:
+        print(f"[INFO] No checkpoint found at {ckpt_path}. Training from scratch.")
+
     policy.eval()
-    policy.cuda()
-    
+    policy.to(device)
+
     optimizer = torch.optim.AdamW(latent_model.parameters(), lr=config['lr'])
 
     train_history = []
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
+
     for epoch in tqdm(range(num_epochs)):
         print(f'\nEpoch {epoch}')
-        # validation
-        with torch.inference_mode():
-            latent_model.eval()
-            epoch_dicts = []
-            for batch_idx, data in enumerate(val_dataloader):
-                forward_dict = forward_pass(data, policy, latent_model)
-                epoch_dicts.append(forward_dict)
-            epoch_summary = compute_dict_mean(epoch_dicts)
-            validation_history.append(epoch_summary)
 
-            epoch_val_loss = epoch_summary['loss']
-            if epoch_val_loss < min_val_loss:
-                min_val_loss = epoch_val_loss
-                best_ckpt_info = (epoch, min_val_loss, deepcopy(latent_model.state_dict()))
-        print(f'Val loss:   {epoch_val_loss:.5f}')
-        summary_string = ''
-        for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
+        # Validation
+        if epoch % validate_every == 0:
+            with torch.inference_mode():
+                latent_model.eval()
+                epoch_dicts = []
+                for batch_idx, data in enumerate(val_dataloader):
+                    forward_dict = forward_pass(data, policy, latent_model, device)
+                    epoch_dicts.append(forward_dict)
+                epoch_summary = compute_dict_mean(epoch_dicts)
+                validation_history.append(epoch_summary)
 
-        # training
+                epoch_val_loss = epoch_summary['loss']
+                if epoch_val_loss < min_val_loss:
+                    min_val_loss = epoch_val_loss
+                    best_ckpt_info = (epoch, min_val_loss, deepcopy(latent_model.state_dict()))
+            print(f'Val loss:   {epoch_val_loss:.5f}')
+            print(' '.join(f'{k}: {v.item():.3f}' for k, v in epoch_summary.items()))
+
+        # Training
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy, latent_model)
-            # backward
+            forward_dict = forward_pass(data, policy, latent_model, device)
             loss = forward_dict['loss']
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
+
+        # Train loss summary
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
         print(f'Train loss: {epoch_train_loss:.5f}')
-        summary_string = ''
-        for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
+        print(' '.join(f'{k}: {v.item():.3f}' for k, v in epoch_summary.items()))
 
-        if epoch % 100 == 0:
+        # Save + plot
+        if epoch % save_every == 0:
             ckpt_path = os.path.join(ckpt_dir, f'latent_model_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(latent_model.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
-    ckpt_path = os.path.join(ckpt_dir, f'latent_model_last.ckpt')
-    torch.save(latent_model.state_dict(), ckpt_path)
+    # 마지막 저장
+    torch.save(latent_model.state_dict(), os.path.join(ckpt_dir, f'latent_model_last.ckpt'))
 
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(ckpt_dir, f'latent_model_epoch_{best_epoch}_seed_{seed}.ckpt')
-    torch.save(best_state_dict, ckpt_path)
+    torch.save(best_state_dict, os.path.join(ckpt_dir, f'latent_model_epoch_{best_epoch}_seed_{seed}.ckpt'))
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
 
-    # save training curves
     plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
 
     return best_ckpt_info
+
+
+
 
 
 def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
@@ -449,13 +480,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
-    parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
-    parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
+    parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir')
+    parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize')
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
+    parser.add_argument('--dataset_dir', type=str, default=None, help='Path to dataset directory')
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
@@ -466,5 +498,11 @@ if __name__ == '__main__':
     parser.add_argument('--use_vq', action='store_true')
     parser.add_argument('--vq_class', action='store', type=int, help='vq_class')
     parser.add_argument('--vq_dim', action='store', type=int, help='vq_dim')
+    parser.add_argument("--num_steps", type=int, default=10000, help="Total number of training steps for ACT model")
+    parser.add_argument('--save_every', type=int, default=500, help='checkpoint save frequency')
+    parser.add_argument('--eval_every', type=int, default=500, help='evaluation frequency')
+    parser.add_argument('--validate_every', type=int, default=500, help='validation frequency')
+
+
     
     main(vars(parser.parse_args()))
